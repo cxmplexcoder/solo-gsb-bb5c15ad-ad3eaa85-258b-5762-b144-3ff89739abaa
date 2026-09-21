@@ -19,6 +19,15 @@ from .displaybody import select_display_body
 from .errors import MIMEParseError
 from .mimeparser import fingerprint, parse_message, raw_sha256
 from .related import audit_related_resources
+from .security import (
+    DEFAULT_FORBIDDEN_MEDIA_TYPES,
+    DEFAULT_MAX_ATTACHMENTS,
+    DEFAULT_MAX_DECODED_BYTES,
+    DEFAULT_MAX_DEPTH,
+    SecurityPolicy,
+    evaluate_security,
+    parse_forbidden_media_types,
+)
 from .schemas import (
     AttachmentListResponse,
     AttachmentOccurrence,
@@ -36,6 +45,10 @@ from .schemas import (
     RelatedReference,
     RelatedResourcesResponse,
     RelatedScope,
+    SecurityLimits,
+    SecurityReportResponse,
+    SecurityTotals,
+    SecurityViolation,
     TreeNode,
     TreeResponse,
 )
@@ -71,8 +84,11 @@ app = FastAPI(
         "/messages/{id}/display-body 则按 multipart/alternative、"
         "multipart/related（start 参数）与 multipart/mixed 的递归"
         "规则选出客户端应展示的正文，并返回逐层选择轨迹。"
+        "/messages/{id}/security-report 对已归档 MIME 树执行确定性"
+        "的附件安全策略评估（双扩展名/控制字符文件名、禁止媒体类型、"
+        "嵌套报文与解码字节/附件数/深度阈值），纯只读。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -423,6 +439,100 @@ def get_related_resources(
                 orphans=[RelatedOrphan(**o) for o in s["orphans"]],
             )
             for s in scopes
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 附件安全策略评估
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/messages/{message_id}/security-report",
+    response_model=SecurityReportResponse,
+)
+def get_security_report(
+    message_id: int,
+    max_decoded_bytes: int = Query(
+        DEFAULT_MAX_DECODED_BYTES,
+        ge=0,
+        description="解码字节总量上限（严格大于即违规）",
+    ),
+    max_attachments: int = Query(
+        DEFAULT_MAX_ATTACHMENTS,
+        ge=0,
+        description="附件节点数量上限（严格大于即违规）",
+    ),
+    max_depth: int = Query(
+        DEFAULT_MAX_DEPTH,
+        ge=0,
+        description="MIME 树最大深度上限（严格大于即违规）",
+    ),
+    forbidden_media_types: Optional[str] = Query(
+        None,
+        max_length=2000,
+        description="逗号分隔的禁止媒体类型清单（type/subtype），"
+        "提供时整体替换默认清单",
+    ),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> SecurityReportResponse:
+    """对已归档 MIME 树执行确定性的附件安全策略评估（纯只读）。
+
+    从根节点按物化路径递归累计解码字节、附件数量与 MIME 深度，并逐
+    节点检查：附件文件名的双扩展名（``DOUBLE_EXTENSION``）与控制
+    字符（``CONTROL_CHAR_IN_FILENAME``）、禁止媒体类型
+    （``FORBIDDEN_MEDIA_TYPE``）、嵌套 ``message/rfc822`` /
+    ``message/global`` 封装报文（``NESTED_MESSAGE``）；总量超过阈值
+    时追加 ``DECODED_BYTES_EXCEEDED`` / ``TOO_MANY_ATTACHMENTS`` /
+    ``MAX_DEPTH_EXCEEDED``。任一命中即 ``allow=false``。
+
+    阈值与禁止清单均可由查询参数覆盖默认值；参数非法（负数、非整数、
+    非法媒体类型）返回 **422**；邮件不存在返回 **404**。评估只读取
+    归档时保存的节点，不修改任何记录，同一归档重复请求结果一致。
+    """
+
+    # 先校验策略参数（请求形状错误优先于资源缺失）。
+    if forbidden_media_types is None:
+        forbidden = DEFAULT_FORBIDDEN_MEDIA_TYPES
+    else:
+        try:
+            forbidden = parse_forbidden_media_types(forbidden_media_types)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+
+    msg = database.get_message(conn, message_id)
+    if msg is None:
+        raise _message_404(message_id)
+    rows = database.list_nodes(conn, message_id)
+
+    policy = SecurityPolicy(
+        max_decoded_bytes=max_decoded_bytes,
+        max_attachments=max_attachments,
+        max_depth=max_depth,
+        forbidden_media_types=forbidden,
+    )
+    report = evaluate_security(rows, policy)
+    return SecurityReportResponse(
+        id=message_id,
+        fingerprint=msg["fingerprint"],
+        allow=not report.violations,
+        limits=SecurityLimits(
+            max_decoded_bytes=policy.max_decoded_bytes,
+            max_attachments=policy.max_attachments,
+            max_depth=policy.max_depth,
+            forbidden_media_types=list(policy.forbidden_media_types),
+        ),
+        totals=SecurityTotals(
+            decoded_bytes=report.totals.decoded_bytes,
+            attachments=report.totals.attachments,
+            max_depth=report.totals.max_depth,
+        ),
+        violations=[
+            SecurityViolation(
+                code=v.code, node_path=v.node_path, detail=v.detail
+            )
+            for v in report.violations
         ],
     )
 

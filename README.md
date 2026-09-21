@@ -15,7 +15,10 @@ Content-Transfer-Encoding、字符集、RFC 2047 编码字、RFC 2231 参数）�
 - 相同指纹重复提交是幂等的（返回同一 id，`created=false`）；
 - 所有非文本叶子的解码字节进入**内容寻址附件库**（按 SHA-256 去重），
   记录每次出现的 `message_id` / `node_path` / 解码文件名 / disposition，
-  支持分页检索与带 `Range` 的下载。
+  支持分页检索与带 `Range` 的下载；
+- `GET /messages/{id}/security-report` 对已归档 MIME 树做**确定性的
+  附件安全策略评估**（双扩展名 / 控制字符文件名、禁止媒体类型、嵌套
+  封装报文、解码字节 / 附件数 / 深度阈值），纯只读、可复现。
 
 技术栈：FastAPI + SQLite（标准库 `sqlite3`，无 ORM），无第三方 MIME
 解析库——解析器按 RFC 严格手工实现，刻意不使用容错的 Python `email` 包。
@@ -28,11 +31,12 @@ app/
   mimeparser.py  严格 MIME/RFC 5322 解析、传输解码、规范化与指纹
   related.py     cid: 内嵌资源引用审计（RFC 2392，multipart/related 作用域）
   displaybody.py 展示正文选择（alternative/related/mixed 递归规则，纯只读）
+  security.py    附件安全策略评估（文件名/媒体类型/嵌套报文/总量阈值，纯只读）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     响应模型
-tests/           175 个 pytest 用例（指纹稳定性、损坏输入、附件库、
-                 cid 引用审计、展示正文选择、HTTP 端到端）
+tests/           202 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+                 cid 引用审计、展示正文选择、附件安全评估、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -102,6 +106,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/nodes/{path}` | 单个节点详情（头字段、文本/二进制哈希） |
 | GET | `/messages/{id}/related-resources` | 审计 HTML 对 `cid:` 内嵌资源的引用（见下） |
 | GET | `/messages/{id}/display-body?prefer=html\|plain` | 选择客户端应展示的正文（见下） |
+| GET | `/messages/{id}/security-report` | 附件安全策略评估（见下） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
 | GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 `bytes` Range） |
 
@@ -300,6 +305,84 @@ alternative 分支即使内部含 `start` 配置错误也不阻断其他分支�
   | ---- | ---- |
   | `AMBIGUOUS_RELATED_START` | `start` 在直接子件中重复命中 Content-ID，`detail.candidates` 给出全部命中子件路径，`detail.start` 为规范化后的 ID |
   | `RELATED_START_NOT_FOUND` | 配置了 `start` 但没有任何直接子件声明该 Content-ID（只匹配直接子件，不向内层后代串联），`detail.start` 为该 ID |
+
+## 附件安全策略评估
+
+```bash
+curl http://localhost:8000/messages/1/security-report
+curl 'http://localhost:8000/messages/1/security-report?max_attachments=5&max_depth=4'
+curl 'http://localhost:8000/messages/1/security-report?forbidden_media_types=application/pdf,application/x-sh'
+```
+
+在**已归档 MIME 树**上执行确定性的附件安全策略评估。该接口是**纯只读
+查询**：只读取归档时保存的节点与头字段，不修改任何记录，同一归档重复
+请求得到逐字节一致的结果，对历史归档数据同样有效（无需重新归档）。
+
+从根节点按物化路径**递归累计**三项总量（`totals`）：
+
+- `decoded_bytes` —— 全部叶子的解码字节数：`blob` 叶子取归档时留存的
+  解码长度，`text` 叶子取规范化文本的 UTF-8 编码长度；
+- `attachments` —— 附件节点数：`Content-Disposition: attachment`
+  **或**声明了文件名（Content-Disposition `filename` / Content-Type
+  `name`，均已完成 RFC 2231 解码）的节点；
+- `max_depth` —— 树的最大 MIME 深度（根为 0）。
+
+逐节点策略检查（每次命中产生一条 violation）：
+
+| `code` | 触发条件 |
+| ---- | ---- |
+| `DOUBLE_EXTENSION` | 附件文件名以两个连续 ASCII 扩展名结尾（`invoice.pdf.exe`、`archive.tar.gz` 均命中），`detail.extensions` 给出最后两个扩展名 |
+| `CONTROL_CHAR_IN_FILENAME` | 文件名含 Unicode 类别 Cc（控制字符）或 Cf（格式字符，如 U+202E 反向覆盖）的字符，`detail.control_characters` 给出位置与码位 |
+| `FORBIDDEN_MEDIA_TYPE` | 附件节点的媒体类型命中禁止清单 |
+| `NESTED_MESSAGE` | 深度 ≥ 1 的 `message/rfc822` / `message/global` 封装报文（根节点本身是被归档的邮件，不计） |
+| `DECODED_BYTES_EXCEEDED` | 解码字节总量 **严格大于** `max_decoded_bytes`（`node_path` 为根 `""`） |
+| `TOO_MANY_ATTACHMENTS` | 附件数量严格大于 `max_attachments`（`node_path` 为根 `""`） |
+| `MAX_DEPTH_EXCEEDED` | MIME 深度严格大于 `max_depth`（`node_path` 定位最深节点） |
+
+任一 violation 命中即 `allow=false`，否则 `allow=true`。violation 顺序
+确定：先按文档序逐节点输出，再按字节数、附件数、深度的固定顺序输出阈值
+违规。响应示例（命中时）：
+
+```json
+{
+  "id": 1,
+  "fingerprint": "defeef89…299c40",
+  "allow": false,
+  "limits": {
+    "max_decoded_bytes": 10000000,
+    "max_attachments": 20,
+    "max_depth": 10,
+    "forbidden_media_types": ["application/x-msdownload", "…"]
+  },
+  "totals": {"decoded_bytes": 51, "attachments": 1, "max_depth": 1},
+  "violations": [
+    {
+      "code": "DOUBLE_EXTENSION",
+      "node_path": "2",
+      "detail": {"filename": "invoice.pdf.exe", "extensions": ["pdf", "exe"]}
+    }
+  ]
+}
+```
+
+阈值与禁止清单均可由查询参数覆盖默认值（`limits` 回显本次实际生效的
+策略）：
+
+| 查询参数 | 默认 | 说明 |
+| ---- | ---- | ---- |
+| `max_decoded_bytes` | `10000000` | 解码字节总量上限（非负整数） |
+| `max_attachments` | `20` | 附件节点数量上限（非负整数） |
+| `max_depth` | `10` | MIME 树最大深度上限（非负整数） |
+| `forbidden_media_types` | 常见可执行类型清单 | 逗号分隔的 `type/subtype` 清单，**提供时整体替换**默认清单（大小写不敏感） |
+
+默认禁止清单：`application/x-msdownload`、`application/x-msdos-program`、
+`application/x-dosexec`、`application/x-executable`、
+`application/vnd.microsoft.portable-executable`、`application/x-bat`、
+`application/x-sh`。
+
+异常情况：邮件不存在返回 **404**；参数非法（负数、非整数、非法媒体
+类型等）返回 **422**——请求形状错误优先于资源缺失，即邮件不存在且
+参数非法时同样返回 422。
 
 ## 内容寻址附件库
 
