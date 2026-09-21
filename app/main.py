@@ -36,8 +36,18 @@ from .schemas import (
     RelatedReference,
     RelatedResourcesResponse,
     RelatedScope,
+    SecurityReportResponse,
+    SecurityThresholds,
+    SecurityTotals,
+    SecurityViolation,
     TreeNode,
     TreeResponse,
+)
+from .security import (
+    DEFAULT_MAX_ATTACHMENT_COUNT,
+    DEFAULT_MAX_DECODED_BYTES,
+    DEFAULT_MAX_MIME_DEPTH,
+    evaluate_security_report,
 )
 
 DEFAULT_DB_PATH = "/data/mime.db"
@@ -71,8 +81,11 @@ app = FastAPI(
         "/messages/{id}/display-body 则按 multipart/alternative、"
         "multipart/related（start 参数）与 multipart/mixed 的递归"
         "规则选出客户端应展示的正文，并返回逐层选择轨迹。"
+        "/messages/{id}/security-report 在已保存 MIME 树上做确定性的"
+        "只读附件安全策略评估（双扩展/控制字符文件名、禁止媒体类型、"
+        "嵌套封装报文与规模阈值），不改写任何记录。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -423,6 +436,83 @@ def get_related_resources(
                 orphans=[RelatedOrphan(**o) for o in s["orphans"]],
             )
             for s in scopes
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 附件安全策略评估
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/messages/{message_id}/security-report",
+    response_model=SecurityReportResponse,
+)
+def get_security_report(
+    message_id: int,
+    max_decoded_bytes: int = Query(
+        DEFAULT_MAX_DECODED_BYTES,
+        ge=0,
+        description="全部附件解码字节合计上限（严格大于才命中）",
+    ),
+    max_attachment_count: int = Query(
+        DEFAULT_MAX_ATTACHMENT_COUNT,
+        ge=0,
+        description="单封邮件附件数量上限（严格大于才命中）",
+    ),
+    max_mime_depth: int = Query(
+        DEFAULT_MAX_MIME_DEPTH,
+        ge=0,
+        description="MIME 树深度上限，根为 0（严格大于才命中）",
+    ),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> SecurityReportResponse:
+    """对已归档 MIME 树执行只读、确定性的附件安全策略评估。
+
+    按节点物化路径做文档序遍历，递归累计全部非文本叶子的解码字节、
+    附件数量与 MIME 深度，并检查附件文件名的**双扩展**与**控制
+    字符**、附件的**禁止媒体类型**以及深度 ≥ 1 处的**嵌套封装
+    报文**（``message/rfc822`` / ``message/global``）。三个规模
+    阈值可用查询参数覆盖（非整数或负数 → 422）。
+
+    任一规则命中都会在 ``violations`` 中给出
+    ``code`` / ``node_path`` / ``detail``，且 ``allow=false``；
+    无命中时 ``allow=true``。同一归档重复请求结果稳定，且不修改
+    数据库。邮件不存在返回 **404**。
+    """
+
+    msg = database.get_message(conn, message_id)
+    if msg is None:
+        raise _message_404(message_id)
+    rows = database.list_nodes(conn, message_id)
+    report = evaluate_security_report(
+        rows,
+        max_decoded_bytes=max_decoded_bytes,
+        max_attachment_count=max_attachment_count,
+        max_mime_depth=max_mime_depth,
+    )
+    return SecurityReportResponse(
+        id=message_id,
+        fingerprint=msg["fingerprint"],
+        allow=report.allow,
+        totals=SecurityTotals(
+            decoded_bytes=report.totals.decoded_bytes,
+            attachment_count=report.totals.attachment_count,
+            max_depth=report.totals.max_depth,
+        ),
+        thresholds=SecurityThresholds(
+            max_decoded_bytes=max_decoded_bytes,
+            max_attachment_count=max_attachment_count,
+            max_mime_depth=max_mime_depth,
+        ),
+        violations=[
+            SecurityViolation(
+                code=v.code,
+                node_path=v.node_path,
+                detail=v.detail,
+            )
+            for v in report.violations
         ],
     )
 

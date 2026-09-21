@@ -28,11 +28,12 @@ app/
   mimeparser.py  严格 MIME/RFC 5322 解析、传输解码、规范化与指纹
   related.py     cid: 内嵌资源引用审计（RFC 2392，multipart/related 作用域）
   displaybody.py 展示正文选择（alternative/related/mixed 递归规则，纯只读）
+  security.py    附件安全策略评估（双扩展/控制字符/禁止类型/嵌套/阈值，纯只读）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     响应模型
-tests/           175 个 pytest 用例（指纹稳定性、损坏输入、附件库、
-                 cid 引用审计、展示正文选择、HTTP 端到端）
+tests/           205 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+                 cid 引用审计、展示正文选择、安全策略评估、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -102,6 +103,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/nodes/{path}` | 单个节点详情（头字段、文本/二进制哈希） |
 | GET | `/messages/{id}/related-resources` | 审计 HTML 对 `cid:` 内嵌资源的引用（见下） |
 | GET | `/messages/{id}/display-body?prefer=html\|plain` | 选择客户端应展示的正文（见下） |
+| GET | `/messages/{id}/security-report` | 只读附件安全策略评估（见下，阈值可查询参数覆盖） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
 | GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 `bytes` Range） |
 
@@ -300,6 +302,89 @@ alternative 分支即使内部含 `start` 配置错误也不阻断其他分支�
   | ---- | ---- |
   | `AMBIGUOUS_RELATED_START` | `start` 在直接子件中重复命中 Content-ID，`detail.candidates` 给出全部命中子件路径，`detail.start` 为规范化后的 ID |
   | `RELATED_START_NOT_FOUND` | 配置了 `start` 但没有任何直接子件声明该 Content-ID（只匹配直接子件，不向内层后代串联），`detail.start` 为该 ID |
+
+## 附件安全策略评估
+
+```bash
+curl http://localhost:8000/messages/1/security-report
+curl 'http://localhost:8000/messages/1/security-report?max_decoded_bytes=1048576&max_attachment_count=10&max_mime_depth=5'
+```
+
+在**已归档 MIME 树**上执行确定性的附件安全策略评估。该接口是**纯只读
+查询**：只读取归档时保存的节点行（与内容寻址附件库口径一致），不改写
+任何记录，对历史归档数据同样有效；评估结果只由节点行与显式阈值决定，
+**同一归档重复请求结果稳定**。
+
+按节点物化路径做文档序（先根后子、兄弟按 1..n）遍历，递归累计
+`totals`：
+
+- `decoded_bytes` —— 全部**非文本叶子**（`kind == "blob"`，即附件
+  节点；`text/*` 叶子不计）的**解码后字节**合计（`blob_length`
+  之和，同一内容出现多次按多次累计）；
+- `attachment_count` —— 非文本叶子个数；
+- `max_depth` —— MIME 树最大深度（根为 0，封装报文内部节点照常计入）。
+
+命中的每条规则在 `violations` 中给出 `code` / `node_path` /
+`detail`，并使 `allow=false`；无任何命中时 `allow=true`、
+`violations=[]`。规则：
+
+| `code` | 命中条件 | `detail` |
+| ---- | ---- | ---- |
+| `DOUBLE_EXTENSION` | 附件文件名 basename 含 **两个及以上非空扩展名段**（如 `invoice.pdf.exe`；`archive.tar.gz` 同样命中，`.bashrc` / 无扩展名不命中） | `filename`、`extensions` |
+| `FILENAME_CONTROL_CHARS` | 文件名含 **Unicode 控制字符**（`Cc` 类：C0 含 NUL/TAB/换行、DEL、C1） | `filename`、去重后按序的 `codepoints`（如 `["U+0009"]`） |
+| `FORBIDDEN_MEDIA_TYPE` | 附件 Content-Type 命中内置可执行类型黑名单（`application/x-msdownload`、`application/x-msi`、`application/java-archive` 等，大小写无关精确匹配） | `content_type`（小写） |
+| `NESTED_MESSAGE` | 深度 ≥ 1 处出现 `message/rfc822` / `message/global` 封装容器（**根自身是封装报文不算嵌套**） | `content_type` |
+| `DECODED_BYTES_EXCEEDED` | 累计解码字节**严格大于** `max_decoded_bytes`；只报文档序第一个把累计推过阈值的附件节点 | `limit`、`decoded_bytes`、`node_bytes` |
+| `ATTACHMENT_COUNT_EXCEEDED` | 附件数**严格大于** `max_attachment_count`；只报第一个越界附件节点 | `limit`、`count` |
+| `MIME_DEPTH_EXCEEDED` | 节点深度**严格大于** `max_mime_depth`；只报第一个越界节点 | `limit`、`depth` |
+
+文件名取节点 `Content-Disposition` 的 `filename`（含 RFC 2231
+`filename*=`），缺省时回退 `Content-Type` 的 `name`；两者都没有的
+附件节点不做文件名类检查（仍计入 `totals` 与媒体类型检查）。阈值为
+“严格大于”语义——恰好等于阈值不命中。
+
+阈值可通过查询参数覆盖默认值；非整数或负数返回 **422**：
+
+| 查询参数 | 默认值 |
+| ---- | ---- |
+| `max_decoded_bytes` | `10485760`（10 MiB） |
+| `max_attachment_count` | `100` |
+| `max_mime_depth` | `20` |
+
+响应示例（一封带双扩展可执行附件的邮件）：
+
+```json
+{
+  "id": 1,
+  "fingerprint": "78d5be53…d01b1",
+  "allow": false,
+  "totals": {
+    "decoded_bytes": 10,
+    "attachment_count": 1,
+    "max_depth": 1
+  },
+  "thresholds": {
+    "max_decoded_bytes": 10485760,
+    "max_attachment_count": 100,
+    "max_mime_depth": 20
+  },
+  "violations": [
+    {
+      "code": "FORBIDDEN_MEDIA_TYPE",
+      "node_path": "2",
+      "detail": {"content_type": "application/x-msdownload"}
+    },
+    {
+      "code": "DOUBLE_EXTENSION",
+      "node_path": "2",
+      "detail": {"filename": "invoice.pdf.exe", "extensions": ["pdf", "exe"]}
+    }
+  ]
+}
+```
+
+无风险邮件返回 `"allow": true` 与空 `violations`。邮件不存在返回
+**404**；阈值参数非法（负数、非整数）返回 **422**。
 
 ## 内容寻址附件库
 

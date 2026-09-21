@@ -179,6 +179,44 @@ class DisplayBodyResponse(BaseModel):
     trail: list[DisplayBodyStep]
 
 
+# ---------------------------------------------------------------------------
+# 附件安全策略评估（GET /messages/{id}/security-report）
+# ---------------------------------------------------------------------------
+
+
+class SecurityViolation(BaseModel):
+    """一条安全规则命中。"""
+
+    code: str
+    node_path: str
+    detail: dict
+
+
+class SecurityTotals(BaseModel):
+    """按节点路径递归累计的规模量。"""
+
+    decoded_bytes: int  # 全部非文本叶子的解码字节合计
+    attachment_count: int  # 非文本叶子（附件）个数
+    max_depth: int  # MIME 树最大深度（根为 0）
+
+
+class SecurityThresholds(BaseModel):
+    """本次评估实际生效的阈值（默认值或查询参数覆盖后的值）。"""
+
+    max_decoded_bytes: int
+    max_attachment_count: int
+    max_mime_depth: int
+
+
+class SecurityReportResponse(BaseModel):
+    id: int
+    fingerprint: str
+    allow: bool  # 无任何 violation 时为 true
+    totals: SecurityTotals
+    thresholds: SecurityThresholds
+    violations: list[SecurityViolation]
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str
